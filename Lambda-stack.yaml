@@ -1,0 +1,157 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Step 2 - Add Lambda, IAM, and S3 trigger for Rekognition
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: The name of the existing S3 bucket to connect
+
+Resources:
+
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RekognitionLambdaExecutionRole
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: RekognitionLambdaPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - rekognition:DetectLabels
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                Resource: !Sub "arn:aws:s3:::${BucketName}/*"
+              - Effect: Allow
+                Action:
+                  - s3:PutBucketNotification
+                Resource: !Sub "arn:aws:s3:::${BucketName}"
+
+  RekognitionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: RekognitionImageAnalysis
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.lambda_handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+
+          def lambda_handler(event, context):
+              rekognition = boto3.client('rekognition', region_name='ap-southeast-1')
+              s3_info = event['Records'][0]['s3']
+              bucket = s3_info['bucket']['name']
+              key = s3_info['object']['key']
+
+              response = rekognition.detect_labels(
+                  Image={'S3Object': {'Bucket': bucket, 'Name': key}},
+                  MaxLabels=10
+              )
+
+              labels = response['Labels']
+              print("Detected labels for image:", key)
+              for label in labels:
+                  print(f"{label['Name']} : {round(label['Confidence'], 2)}%")
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps('Image processed successfully')
+              }
+
+  BucketLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref RekognitionLambda
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${BucketName}"
+
+  S3NotificationLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: S3NotificationHelper
+      Runtime: python3.12
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Handler: index.handler
+      Timeout: 30
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import urllib3
+          import logging
+
+          http = urllib3.PoolManager()
+          SUCCESS = "SUCCESS"
+          FAILED = "FAILED"
+
+          def send_response(event, context, response_status, response_data, physical_resource_id=None, no_echo=False):
+              response_url = event['ResponseURL']
+              response_body = {
+                  'Status': response_status,
+                  'Reason': f'See the details in CloudWatch Log Stream: {context.log_stream_name}',
+                  'PhysicalResourceId': physical_resource_id or context.log_stream_name,
+                  'StackId': event['StackId'],
+                  'RequestId': event['RequestId'],
+                  'LogicalResourceId': event['LogicalResourceId'],
+                  'NoEcho': no_echo,
+                  'Data': response_data
+              }
+
+              encoded_body = json.dumps(response_body).encode('utf-8')
+              headers = {
+                  'content-type': '',
+                  'content-length': str(len(encoded_body))
+              }
+
+              try:
+                  response = http.request('PUT', response_url, body=encoded_body, headers=headers)
+                  print(f"Status code: {response.status}")
+              except Exception as e:
+                  print(f"send_response failed: {e}")
+
+          def handler(event, context):
+              s3 = boto3.client('s3')
+              props = event['ResourceProperties']
+              bucket = props['Bucket']
+              notif_config = props['NotificationConfiguration']
+
+              try:
+                  s3.put_bucket_notification_configuration(
+                      Bucket=bucket,
+                      NotificationConfiguration=notif_config
+                  )
+                  send_response(event, context, SUCCESS, {})
+              except Exception as e:
+                  logging.exception("Failed to configure bucket notification")
+                  send_response(event, context, FAILED, {'Error': str(e)})
+
+  S3Notification:
+    Type: Custom::S3Notification
+    DependsOn: RekognitionLambda
+    Properties:
+      ServiceToken: !GetAtt S3NotificationLambdaFunction.Arn
+      Bucket: !Ref BucketName
+      NotificationConfiguration:
+        LambdaFunctionConfigurations:
+          - Events:
+              - s3:ObjectCreated:*
+            LambdaFunctionArn: !GetAtt RekognitionLambda.Arn
