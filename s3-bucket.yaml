@@ -1,0 +1,18 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Step 1 - Create S3 bucket for image uploads
+
+Parameters:
+  BucketName:
+    Type: String
+    Description: Name of the S3 bucket (must be globally unique)
+
+Resources:
+  ImageBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Ref BucketName
+
+Outputs:
+  UploadBucketName:
+    Description: The S3 bucket for image uploads
+    Value: !Ref ImageBucket
